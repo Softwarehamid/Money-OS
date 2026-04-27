@@ -21,8 +21,10 @@ const seedState = {
   plannedSavings: 0,
   monthlyDebtTarget: 0,
   monthlySavingsPace: 0,
+  templateProjectionMonths: 6,
   paychecks: [],
   bills: [],
+  billTemplates: [],
   debts: [],
   budgetCategories: [],
   savingsGoals: [],
@@ -59,8 +61,11 @@ todayLabel.textContent = formatDate(today, {
 function loadState() {
   const stored = localStorage.getItem(storageKey);
   const parsed = stored ? JSON.parse(stored) : structuredClone(seedState);
-  return normalizeState(parsed);
+  const normalized = normalizeState(parsed);
+  return normalized;
 }
+// perform migration after `state` is initialized to avoid TDZ issues
+migrateBillsToTemplatesIfNeeded();
 
 function normalizeState(input) {
   const next = { ...structuredClone(seedState), ...(input || {}) };
@@ -71,7 +76,17 @@ function normalizeState(input) {
   next.monthlyDebtTarget = Number(next.monthlyDebtTarget) || 0;
   next.monthlySavingsPace = Number(next.monthlySavingsPace) || 0;
   next.paychecks = Array.isArray(next.paychecks) ? next.paychecks : [];
-  next.bills = Array.isArray(next.bills) ? next.bills : [];
+  next.bills = Array.isArray(next.bills)
+    ? next.bills.map((bill) => ({
+        ...bill,
+        paidAmount: Number(bill.paidAmount) || 0,
+        repeat: bill.repeat || "monthly",
+      }))
+    : [];
+  next.billTemplates = Array.isArray(next.billTemplates)
+    ? next.billTemplates.map((t) => ({ ...t }))
+    : [];
+  next.templateProjectionMonths = Number(next.templateProjectionMonths) || 6;
   next.debts = Array.isArray(next.debts) ? next.debts : [];
   next.budgetCategories = Array.isArray(next.budgetCategories)
     ? next.budgetCategories
@@ -117,17 +132,105 @@ function daysUntil(date) {
   );
 }
 
+function addMonthsKeepingDay(dateString, months) {
+  const date = new Date(`${dateString}T12:00:00`);
+  const targetDay = date.getDate();
+  date.setMonth(date.getMonth() + months, 1);
+  const lastDay = new Date(
+    date.getFullYear(),
+    date.getMonth() + 1,
+    0,
+  ).getDate();
+  date.setDate(Math.min(targetDay, lastDay));
+  return toDateString(date);
+}
+
 function getNextPaycheck() {
   return [...state.paychecks]
     .filter((paycheck) => daysUntil(paycheck.payDate) >= 0)
     .sort((a, b) => a.payDate.localeCompare(b.payDate))[0];
 }
 
+function createBillTemplateFromEntry(entry) {
+  // derive dueDay from a full dueDate if present
+  const dueDay = entry.dueDate
+    ? new Date(`${entry.dueDate}T12:00:00`).getDate()
+    : null;
+  return {
+    id: crypto.randomUUID(),
+    name: entry.name,
+    amount: Number(entry.amountDue) || 0,
+    dueDay,
+    category: entry.category || "",
+    priority: entry.priority || "",
+    repeats: entry.repeat || "monthly",
+    autopay: entry.autopay || false,
+    active: true,
+  };
+}
+
+function generateMonthlyBillInstances(template, monthsAhead = 6) {
+  const instances = [];
+  const todayDate = new Date();
+  for (let i = 0; i < monthsAhead; i++) {
+    const month = todayDate.getMonth() + i;
+    const year = todayDate.getFullYear() + Math.floor(month / 12);
+    const mon = month % 12;
+    const lastDay = new Date(year, mon + 1, 0).getDate();
+    const day = Math.min(template.dueDay || 1, lastDay);
+    const due = new Date(year, mon, day);
+    instances.push({
+      id: crypto.randomUUID(),
+      billTemplateId: template.id,
+      name: template.name,
+      amountDue: Number(template.amount) || 0,
+      dueDate: toDateString(due),
+      paidAmount: 0,
+      status: "unpaid",
+      category: template.category,
+      priority: template.priority,
+    });
+  }
+  return instances;
+}
+
+function migrateBillsToTemplatesIfNeeded() {
+  // If there are existing bills but no templates, convert them to templates and generate instances
+  if (state.billTemplates.length === 0 && state.bills.length > 0) {
+    const existing = [...state.bills];
+    state.billTemplates = existing.map((b) => createBillTemplateFromEntry(b));
+    // generate instances for each template
+    let instances = [];
+    state.billTemplates.forEach((t) => {
+      instances = instances.concat(generateMonthlyBillInstances(t, 6));
+    });
+    state.bills = instances;
+    saveState();
+  }
+}
+
 function billsBeforeNextPaycheck() {
   const next = getNextPaycheck();
   if (!next) return [];
+  const paychecks = [...state.paychecks].sort((a, b) =>
+    a.payDate.localeCompare(b.payDate),
+  );
+  if (paychecks.length === 0) return [];
+
   return state.bills
-    .filter((bill) => bill.dueDate < next.payDate && remainingBill(bill) > 0)
+    .filter((bill) => remainingBill(bill) > 0)
+    .filter((bill) => {
+      // find the paycheck that occurs immediately before the bill's due date
+      let assigned = null;
+      for (let i = 0; i < paychecks.length; i++) {
+        const p = paychecks[i];
+        if (p.payDate <= bill.dueDate) assigned = p;
+        else break;
+      }
+      // if no prior paycheck found, assign to the next upcoming paycheck
+      if (!assigned) assigned = next;
+      return assigned && assigned.id === next.id;
+    })
     .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 }
 
@@ -294,56 +397,40 @@ function render() {
 
 function renderDashboard() {
   const m = metrics();
-  const rec = recommendation();
   const nextText = m.next
     ? `${formatDate(m.next.payDate)} · ${money(m.next.netEstimate)} · ${m.daysLeft} days left`
     : "No paycheck planned";
-  const moveOut = state.savingsGoals.find(
-    (goal) => goal.name === "Move-out fund",
-  );
-  const moveOutCurrent = Number(moveOut?.current || 0);
-  const moveOutTarget = Number(moveOut?.target || 0);
-  const moveOutProgress = moveOutTarget
-    ? Math.min(100, (moveOutCurrent / moveOutTarget) * 100)
-    : 0;
-  const safeTone =
-    m.safeToSpend < 0 ? "danger" : m.safeToSpend < 150 ? "warn" : "good";
 
   return `
     <div class="dashboard-grid">
       ${metricCard("Current cash", money(state.currentCash), "Manual cash available", "hero-card")}
-      ${metricCard("Safe to spend", money(m.safeToSpend), `${money(m.dailyLimit)} per day`, `hero-card ${safeTone}`)}
+      ${metricCard("Safe to spend", money(m.safeToSpend), `${money(m.dailyLimit)} per day`, `hero-card ${m.safeToSpend < 0 ? "danger" : m.safeToSpend < 150 ? "warn" : "good"}`)}
       ${metricCard("Next paycheck", m.next ? formatDate(m.next.payDate) : "None", nextText)}
-      ${metricCard("Bills before next check", money(m.billsDue), `${m.beforeNext.length} items before payday`)}
+      ${metricCard("Reserved for next paycheck", money(m.billsDue), `${m.beforeNext.length} items reserved`)}
       ${metricCard("Debt remaining", money(m.totalDebt), `${money(m.paidThisMonth)} paid this month`)}
       ${metricCard("Emergency buffer", money(state.emergencyBuffer), "Protected from safe spending")}
-      <article class="card">
-        <p class="metric-label">Move-out fund</p>
-        <p class="metric-value">${money(moveOutCurrent)}</p>
-        <p class="metric-sub">${moveOutProgress.toFixed(1)}% of ${money(moveOutTarget)}</p>
-        <div class="progress" style="--progress:${moveOutProgress}%"><span></span></div>
-      </article>
       ${metricCard("Debt-free estimate", estimateDate(m.debtFreeMonths), `${m.debtFreeMonths || 0} months at ${money(state.monthlyDebtTarget)}/mo`)}
     </div>
 
-    <section class="recommendation ${rec.tone === "danger" ? "danger" : rec.tone === "warning" ? "warning" : ""}">
-      <p class="eyebrow">${rec.title}</p>
-      <p>${rec.text}</p>
-    </section>
-
-    <div class="split-grid">
-      <section class="table-panel">
-        <div class="panel-head">
-          <h2>Before Next Paycheck</h2>
-          <button class="tiny-button" data-open="bill" type="button">Add Bill</button>
+    <section class="table-panel">
+      <div class="panel-head">
+        <h2>At a glance</h2>
+      </div>
+      <div class="item-list">
+        <div class="list-item">
+          <span>Next paycheck</span>
+          <span class="pill green">${m.next ? formatDate(m.next.payDate) : "None"}</span>
         </div>
-        <div class="item-list">${m.beforeNext.map(renderBillItem).join("") || emptyState("No bills before the next paycheck.")}</div>
-      </section>
-      <section class="paycheck-plan">
-        <div class="panel-head"><h2>Paycheck Plan</h2></div>
-        ${renderPaycheckPlan()}
-      </section>
-    </div>
+        <div class="list-item">
+          <span>Reserved for next paycheck</span>
+          <span class="pill yellow">${money(m.billsDue)}</span>
+        </div>
+        <div class="list-item">
+          <span>Free after bills</span>
+          <span class="pill ${m.safeToSpend < 0 ? "red" : "green"}">${money(m.safeToSpend)}</span>
+        </div>
+      </div>
+    </section>
   `;
 }
 
@@ -416,30 +503,51 @@ function renderPaychecks() {
 }
 
 function renderBills() {
-  const groups = [
-    ["Due before next paycheck", billsBeforeNextPaycheck()],
-    [
-      "Upcoming this month",
-      state.bills
-        .filter(
-          (bill) =>
-            remainingBill(bill) > 0 &&
-            bill.dueDate >= (getNextPaycheck()?.payDate || ""),
-        )
-        .sort((a, b) => a.dueDate.localeCompare(b.dueDate)),
-    ],
-    ["Paid", state.bills.filter((bill) => remainingBill(bill) === 0)],
-  ];
-  return groups
-    .map(([title, bills]) =>
-      panel(
-        title,
-        "Add Bill",
-        "bill",
-        bills.map(renderBillItem).join("") || emptyState("Nothing here yet."),
-      ),
-    )
+  const templatesPanel = renderTemplates();
+  const unpaidBills = state.bills
+    .filter((bill) => remainingBill(bill) > 0)
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
+  const paidBills = state.bills.filter((bill) => remainingBill(bill) === 0);
+
+  return (
+    templatesPanel +
+    panel(
+      "Bills to Pay",
+      "Add Bill",
+      "bill",
+      unpaidBills.map(renderBillItem).join("") ||
+        emptyState("No bills due. Add a bill to get started."),
+    ) +
+    (paidBills.length > 0
+      ? panel("Payment History", "", "", paidBills.map(renderBillItem).join(""))
+      : "")
+  );
+}
+
+function renderTemplates() {
+  if (!state.billTemplates || state.billTemplates.length === 0) return "";
+  const rows = state.billTemplates
+    .map((t) => {
+      return `
+      <div class="list-item">
+        <div>
+          <strong>${t.name}</strong>
+          <div class="pill-row">
+            <span class="pill">${money(t.amount)}</span>
+            <span class="pill">Due day ${t.dueDay || "n/a"}</span>
+            <span class="pill ${t.active ? "green" : "muted"}">${t.active ? "Active" : "Paused"}</span>
+            <span class="pill">${t.repeats}</span>
+          </div>
+        </div>
+        <div class="row-actions">
+          <button class="tiny-button" data-pause-template="${t.id}" type="button">${t.active ? "Pause" : "Unpause"}</button>
+          <button class="tiny-button" data-delete-template="${t.id}" type="button">Delete</button>
+        </div>
+      </div>
+    `;
+    })
     .join("");
+  return panel("Bill Templates", "Add Bill", "bill", rows);
 }
 
 function renderBillItem(bill) {
@@ -453,6 +561,7 @@ function renderBillItem(bill) {
           <span class="pill">${money(remainingBill(bill))} left</span>
           <span class="pill">${bill.category}</span>
           <span class="pill">${bill.priority}</span>
+          <span class="pill ${bill.repeat === "monthly" ? "green" : "blue"}">${bill.repeat === "monthly" ? "Monthly" : "One-time"}</span>
         </div>
       </div>
       <button class="tiny-button" data-pay-bill="${bill.id}" type="button">Pay</button>
@@ -711,6 +820,18 @@ function bindContentActions() {
     );
   });
 
+  document.querySelectorAll("[data-pause-template]").forEach((button) => {
+    button.addEventListener("click", () =>
+      pauseTemplate(button.dataset.pauseTemplate),
+    );
+  });
+
+  document.querySelectorAll("[data-delete-template]").forEach((button) => {
+    button.addEventListener("click", () =>
+      deleteTemplate(button.dataset.deleteTemplate),
+    );
+  });
+
   deleteEntryBtn?.addEventListener("click", () => {
     if (editingEntryId) deletePaycheck(editingEntryId);
   });
@@ -726,6 +847,21 @@ function bindContentActions() {
     state = structuredClone(seedState);
     saveState();
     render();
+  });
+
+  const editButtons = document.querySelectorAll("[data-edit-template]");
+  editButtons.forEach((button) => {
+    button.addEventListener("click", () =>
+      editTemplate(button.dataset.editTemplate),
+    );
+  });
+
+  const regen = document.querySelector("#regenerateTemplates");
+  regen?.addEventListener("click", () => {
+    const sel = document.querySelector("#projMonths");
+    const months = Number(sel?.value || state.templateProjectionMonths || 6);
+    state.templateProjectionMonths = months;
+    regenerateAllTemplates(months);
   });
 }
 
@@ -769,6 +905,93 @@ function openDialog(type = "paycheck") {
   entryForm.querySelector("#entryEditId")?.remove();
   setDeleteButtonVisible(false);
   entryDialog.showModal();
+}
+
+function pauseTemplate(id) {
+  const tpl = state.billTemplates.find((t) => t.id === id);
+  if (!tpl) return;
+  tpl.active = !tpl.active;
+  saveState();
+  render();
+}
+
+function deleteTemplate(id) {
+  const tpl = state.billTemplates.find((t) => t.id === id);
+  if (!tpl) return;
+  if (
+    !confirm(`Delete template '${tpl.name}' and its future unpaid instances?`)
+  )
+    return;
+  // remove the template
+  state.billTemplates = state.billTemplates.filter((t) => t.id !== id);
+  // remove future unpaid instances tied to this template
+  state.bills = state.bills.filter((b) => {
+    if (b.billTemplateId !== id) return true;
+    // keep past paid instances, remove unpaid or future ones
+    return remainingBill(b) === 0 && b.dueDate < toDateString(today);
+  });
+  saveState();
+  render();
+}
+
+function editTemplate(id) {
+  const tpl = state.billTemplates.find((t) => t.id === id);
+  if (!tpl) return;
+  editingEntryId = id;
+  entryType.value = "bill";
+  updateDialogMeta("bill", true);
+  buildForm("bill");
+  // populate fields: use a fake instance to set form values
+  const fake = {
+    name: tpl.name,
+    category: tpl.category,
+    amountDue: tpl.amount,
+    dueDate: tpl.dueDay
+      ? toDateString(
+          new Date(today.getFullYear(), today.getMonth(), tpl.dueDay),
+        )
+      : "",
+    priority: tpl.priority,
+    repeat: tpl.repeats,
+  };
+  setFormValues("bill", fake);
+  ensureEditField(id);
+  setDeleteButtonVisible(true);
+  entryDialog.showModal();
+}
+
+function regenerateAllTemplates(monthsAhead = 6) {
+  // remove future unpaid instances for all templates
+  state.billTemplates.forEach((tpl) => {
+    state.bills = state.bills.filter((b) => {
+      if (b.billTemplateId !== tpl.id) return true;
+      // keep past paid instances; remove unpaid with dueDate >= today
+      return !(remainingBill(b) > 0 && b.dueDate >= toDateString(today));
+    });
+    if (tpl.active) {
+      const instances = generateMonthlyBillInstances(tpl, monthsAhead);
+      state.bills = state.bills.concat(instances);
+    }
+  });
+  saveState();
+  render();
+}
+
+function regenerateTemplateInstances(templateId, monthsAhead = 6) {
+  const tpl = state.billTemplates.find((t) => t.id === templateId);
+  if (!tpl) return;
+  // remove future unpaid instances tied to this template
+  state.bills = state.bills.filter((b) => {
+    if (b.billTemplateId !== templateId) return true;
+    // keep past paid instances; remove unpaid with dueDate >= today
+    return !(remainingBill(b) > 0 && b.dueDate >= toDateString(today));
+  });
+  if (tpl.active) {
+    const instances = generateMonthlyBillInstances(tpl, monthsAhead);
+    state.bills = state.bills.concat(instances);
+  }
+  saveState();
+  render();
 }
 
 function editPaycheck(id) {
@@ -823,6 +1046,7 @@ function buildForm(type) {
       ["amountDue", "Amount due", "number", ""],
       ["dueDate", "Due date", "date", ""],
       ["priority", "Priority", "text", ""],
+      ["repeat", "Repeat", "select", ""],
     ],
     debt: [
       ["name", "Account name", "text", ""],
@@ -856,7 +1080,14 @@ function buildForm(type) {
       ([name, label, inputType, placeholder]) => `
     <label>
       ${label}
-      <input name="${name}" type="${inputType}" ${inputType === "number" ? 'step="0.01"' : ""} placeholder="${placeholder}" required>
+      ${
+        inputType === "select"
+          ? `<select name="${name}" required>
+              <option value="monthly" selected>Monthly</option>
+              <option value="one-time">One-time</option>
+            </select>`
+          : `<input name="${name}" type="${inputType}" ${inputType === "number" ? 'step="0.01"' : ""} placeholder="${placeholder}" required>`
+      }
     </label>
   `,
     )
@@ -873,6 +1104,7 @@ function setFormValues(type, entry) {
         "regularHours",
         "overtimeHours",
       ],
+      bill: ["name", "category", "amountDue", "dueDate", "priority", "repeat"],
     }[type] || [];
 
   inputs.forEach((name) => {
@@ -944,13 +1176,46 @@ function saveEntry(formData) {
       scheduleNextPaycheck(normalizedPaycheck);
     }
   }
-  if (type === "bill")
-    state.bills.push({
-      ...entry,
-      paidAmount: 0,
-      repeat: "none",
-      autopay: false,
-    });
+  if (type === "bill") {
+    // If editing an existing template, update it and regenerate instances
+    if (editId) {
+      const tpl = state.billTemplates.find((t) => t.id === editId);
+      if (tpl) {
+        tpl.name = entry.name || tpl.name;
+        tpl.amount = Number(entry.amountDue) || tpl.amount;
+        tpl.category = entry.category || tpl.category;
+        tpl.priority = entry.priority || tpl.priority;
+        tpl.repeats = entry.repeat || tpl.repeats;
+        tpl.autopay = entry.autopay ?? tpl.autopay;
+        if (entry.dueDate) {
+          tpl.dueDay = new Date(`${entry.dueDate}T12:00:00`).getDate();
+        }
+        // regenerate instances for this template using current projection setting
+        regenerateTemplateInstances(
+          tpl.id,
+          state.templateProjectionMonths || 6,
+        );
+      } else {
+        // fallback: create a new template
+        const template = createBillTemplateFromEntry(entry);
+        state.billTemplates.push(template);
+        const instances = generateMonthlyBillInstances(
+          template,
+          state.templateProjectionMonths || 6,
+        );
+        state.bills = state.bills.concat(instances);
+      }
+    } else {
+      // create a recurring template and generate instances
+      const template = createBillTemplateFromEntry(entry);
+      state.billTemplates.push(template);
+      const instances = generateMonthlyBillInstances(
+        template,
+        state.templateProjectionMonths || 6,
+      );
+      state.bills = state.bills.concat(instances);
+    }
+  }
   if (type === "debt") state.debts.push(entry);
   if (type === "budget") state.budgetCategories.push(entry);
   if (type === "saving")
@@ -1014,7 +1279,11 @@ function payBill(id) {
   const bill = state.bills.find((item) => item.id === id);
   if (!bill) return;
   const amount = remainingBill(bill);
+  // mark this instance paid
   bill.paidAmount = Number(bill.amountDue);
+  bill.status = "paid";
+  bill.paidDate = toDateString(today);
+
   state.currentCash = Math.max(0, state.currentCash - amount);
   state.payments.push({
     id: crypto.randomUUID(),
@@ -1023,6 +1292,27 @@ function payBill(id) {
     amount,
     type: "bill",
   });
+
+  // If this instance is linked to a template that repeats monthly, create the next instance
+  if (bill.billTemplateId) {
+    const tpl = state.billTemplates.find((t) => t.id === bill.billTemplateId);
+    if (tpl && tpl.repeats === "monthly") {
+      const nextDue = addMonthsKeepingDay(bill.dueDate, 1);
+      const nextInstance = {
+        id: crypto.randomUUID(),
+        billTemplateId: tpl.id,
+        name: tpl.name,
+        amountDue: Number(tpl.amount) || 0,
+        dueDate: nextDue,
+        paidAmount: 0,
+        status: "unpaid",
+        category: tpl.category,
+        priority: tpl.priority,
+      };
+      state.bills.push(nextInstance);
+    }
+  }
+
   saveState();
   render();
 }
