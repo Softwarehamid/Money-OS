@@ -29,10 +29,9 @@ Manual test checklist — Money OS
   - Bill name: "Rent"
   - Amount: $1200
   - Due date: May 15, 2026
-  - Category: "Housing"
   - Repeat: "monthly"
 - Save
-- _Expect: Template appears in "Bill Templates" section; 6 months of instances appear in "Bills to Pay" list sorted by due date_
+- _Expect: Rent appears in the "Due Bills" list with due date, amount left, and action buttons_
 
 ---
 
@@ -40,14 +39,14 @@ Manual test checklist — Money OS
 
 ### Test 1: Pay a bill instance
 
-- In Bills tab, find the Rent bill (May 15) in "Bills to Pay"
+- In Bills tab, find the Rent bill (May 15) in "Due Bills"
 - Click "Pay"
-- _Expect: Instance moved to "Payment History", next month's instance created (Rent June 15) and appears in "Bills to Pay"_
+- _Expect: The row moves lower in the due-bills list and the next month's instance appears as the new current due date_
 - Check Dashboard: "Safe to spend" should decrease by $1200
 
 ### Test 2: Edit template
 
-- In Bills tab, under "Bill Templates", click Edit on Rent
+- In Bills tab, click Edit on Rent in "Due Bills"
 - Change Amount to $1300
 - Change Due date to May 20
 - Save

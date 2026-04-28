@@ -66,6 +66,7 @@ function loadState() {
 }
 // perform migration after `state` is initialized to avoid TDZ issues
 migrateBillsToTemplatesIfNeeded();
+cleanupDuplicateBills();
 
 function normalizeState(input) {
   const next = { ...structuredClone(seedState), ...(input || {}) };
@@ -179,12 +180,14 @@ function generateMonthlyBillInstances(template, monthsAhead = 6) {
     const lastDay = new Date(year, mon + 1, 0).getDate();
     const day = Math.min(template.dueDay || 1, lastDay);
     const due = new Date(year, mon, day);
+    const dueDate = toDateString(due);
+    if (dueDate < toDateString(today)) continue;
     instances.push({
       id: crypto.randomUUID(),
       billTemplateId: template.id,
       name: template.name,
       amountDue: Number(template.amount) || 0,
-      dueDate: toDateString(due),
+      dueDate,
       paidAmount: 0,
       status: "unpaid",
       category: template.category,
@@ -207,6 +210,24 @@ function migrateBillsToTemplatesIfNeeded() {
     state.bills = instances;
     saveState();
   }
+}
+
+function cleanupDuplicateBills() {
+  const seen = new Set();
+
+  state.bills = state.bills
+    .slice()
+    .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+    .filter((bill) => {
+      if (remainingBill(bill) === 0) return true;
+
+      const key = `${bill.billTemplateId || bill.name}-${bill.dueDate}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  saveState();
 }
 
 function billsBeforeNextPaycheck() {
@@ -503,51 +524,80 @@ function renderPaychecks() {
 }
 
 function renderBills() {
-  const templatesPanel = renderTemplates();
-  const unpaidBills = state.bills
-    .filter((bill) => remainingBill(bill) > 0)
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
-  const paidBills = state.bills.filter((bill) => remainingBill(bill) === 0);
-
-  return (
-    templatesPanel +
-    panel(
-      "Bills to Pay",
+  if (!state.billTemplates || state.billTemplates.length === 0) {
+    return panel(
+      "Due Bills",
       "Add Bill",
       "bill",
-      unpaidBills.map(renderBillItem).join("") ||
-        emptyState("No bills due. Add a bill to get started."),
-    ) +
-    (paidBills.length > 0
-      ? panel("Payment History", "", "", paidBills.map(renderBillItem).join(""))
-      : "")
-  );
+      emptyState("No bills yet. Add a bill to get started."),
+    );
+  }
+  return renderTemplates();
 }
 
 function renderTemplates() {
   if (!state.billTemplates || state.billTemplates.length === 0) return "";
   const rows = state.billTemplates
-    .map((t) => {
+    .slice()
+    .sort((a, b) => {
+      const aBill = currentBillInstanceForTemplate(a.id);
+      const bBill = currentBillInstanceForTemplate(b.id);
+      const aDate = aBill
+        ? aBill.dueDate
+        : `9999-${String(a.dueDay || 99).padStart(2, "0")}-99`;
+      const bDate = bBill
+        ? bBill.dueDate
+        : `9999-${String(b.dueDay || 99).padStart(2, "0")}-99`;
+      return aDate.localeCompare(bDate);
+    })
+    .map((template) => {
+      const current = currentBillInstanceForTemplate(template.id);
+      const dueLabel = current
+        ? formatDate(current.dueDate)
+        : template.dueDay
+          ? `day ${template.dueDay}`
+          : "n/a";
+      const tone = current
+        ? urgency(current).tone
+        : template.active
+          ? "green"
+          : "muted";
       return `
       <div class="list-item">
         <div>
-          <strong>${t.name}</strong>
+          <strong>${template.name}</strong>
           <div class="pill-row">
-            <span class="pill">${money(t.amount)}</span>
-            <span class="pill">Due day ${t.dueDay || "n/a"}</span>
-            <span class="pill ${t.active ? "green" : "muted"}">${t.active ? "Active" : "Paused"}</span>
-            <span class="pill">${t.repeats}</span>
+            <span class="pill ${tone}">${current ? urgency(current).label : "Done"}</span>
+            <span class="pill">Due ${dueLabel}</span>
+            <span class="pill">${money(current ? remainingBill(current) : 0)} left</span>
+            <span class="pill ${template.active ? "green" : "muted"}">${template.active ? "Active" : "Paused"}</span>
           </div>
         </div>
         <div class="row-actions">
-          <button class="tiny-button" data-pause-template="${t.id}" type="button">${t.active ? "Pause" : "Unpause"}</button>
-          <button class="tiny-button" data-delete-template="${t.id}" type="button">Delete</button>
+          ${current && remainingBill(current) > 0 && template.active ? `<button class="tiny-button" data-pay-bill="${current.id}" type="button">Pay</button>` : ""}
+          <button class="tiny-button" data-edit-template="${template.id}" type="button">Edit</button>
+          <button class="tiny-button" data-pause-template="${template.id}" type="button">${template.active ? "Pause" : "Unpause"}</button>
+          <button class="tiny-button" data-delete-template="${template.id}" type="button">Delete</button>
         </div>
       </div>
     `;
     })
     .join("");
-  return panel("Bill Templates", "Add Bill", "bill", rows);
+  return panel(
+    "Due Bills",
+    "Add Bill",
+    "bill",
+    rows || emptyState("No bills due. Add a bill to get started."),
+  );
+}
+
+function currentBillInstanceForTemplate(templateId) {
+  return (
+    state.bills
+      .filter((bill) => bill.billTemplateId === templateId)
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
+      .find((bill) => remainingBill(bill) > 0) || null
+  );
 }
 
 function renderBillItem(bill) {
@@ -559,8 +609,6 @@ function renderBillItem(bill) {
         <div class="pill-row">
           <span class="pill ${status.tone}">${status.label}</span>
           <span class="pill">${money(remainingBill(bill))} left</span>
-          <span class="pill">${bill.category}</span>
-          <span class="pill">${bill.priority}</span>
           <span class="pill ${bill.repeat === "monthly" ? "green" : "blue"}">${bill.repeat === "monthly" ? "Monthly" : "One-time"}</span>
         </div>
       </div>
@@ -576,7 +624,7 @@ function renderDebts() {
       ${metricCard("Total debt", money(m.totalDebt), `${state.debts.length} active accounts`, "hero-card")}
       ${metricCard("Paid this month", money(m.paidThisMonth), `Target ${money(state.monthlyDebtTarget)}`)}
       ${metricCard("Minimums", money(sum(state.debts, "minimumPayment")), "Monthly required payments")}
-      ${metricCard("Best payoff", state.debts.sort((a, b) => a.balance - b.balance)[0]?.name || "None", "Hybrid: small payoff first")}
+      ${metricCard("Best payoff", [...state.debts].sort((a, b) => a.balance - b.balance)[0]?.name || "None", "Hybrid: small payoff first")}
     </div>
     ${panel(
       "Debt Accounts",
@@ -833,12 +881,24 @@ function bindContentActions() {
   });
 
   deleteEntryBtn?.addEventListener("click", () => {
-    if (editingEntryId) deletePaycheck(editingEntryId);
+    if (!editingEntryId) return;
+    if (entryType.value === "paycheck") {
+      deletePaycheck(editingEntryId);
+      return;
+    }
+    if (entryType.value === "bill") {
+      deleteTemplate(editingEntryId);
+      editingEntryId = null;
+      entryForm.reset();
+      entryForm.querySelector("#entryEditId")?.remove();
+      setDeleteButtonVisible(false);
+      entryDialog.close();
+    }
   });
 
   document
     .querySelector("#saveSettings")
-    ?.addEventListener("click", saveSettings);
+    ?.addEventListener("click", saveSettingsForm);
   document.querySelector("#exportData")?.addEventListener("click", exportData);
   document
     .querySelector("#importDataInput")
@@ -944,14 +1004,12 @@ function editTemplate(id) {
   // populate fields: use a fake instance to set form values
   const fake = {
     name: tpl.name,
-    category: tpl.category,
     amountDue: tpl.amount,
     dueDate: tpl.dueDay
       ? toDateString(
           new Date(today.getFullYear(), today.getMonth(), tpl.dueDay),
         )
       : "",
-    priority: tpl.priority,
     repeat: tpl.repeats,
   };
   setFormValues("bill", fake);
@@ -1016,10 +1074,17 @@ function updateDialogMeta(type, editing = false) {
     saving: "Add Savings Goal",
     expense: "Add Expense",
   };
-  const label =
-    editing && type === "paycheck"
-      ? "Edit Paycheck"
-      : titles[type] || "Add Item";
+  const editTitles = {
+    paycheck: "Edit Paycheck",
+    bill: "Edit Bill",
+    debt: "Edit Debt",
+    budget: "Edit Budget Category",
+    saving: "Edit Savings Goal",
+    expense: "Edit Expense",
+  };
+  const label = editing
+    ? editTitles[type] || "Edit Item"
+    : titles[type] || "Add Item";
   if (dialogTitle) dialogTitle.textContent = label;
   if (saveEntryBtn)
     saveEntryBtn.textContent = editing
@@ -1042,10 +1107,8 @@ function buildForm(type) {
     ],
     bill: [
       ["name", "Bill name", "text", ""],
-      ["category", "Category", "text", ""],
       ["amountDue", "Amount due", "number", ""],
       ["dueDate", "Due date", "date", ""],
-      ["priority", "Priority", "text", ""],
       ["repeat", "Repeat", "select", ""],
     ],
     debt: [
@@ -1104,7 +1167,7 @@ function setFormValues(type, entry) {
         "regularHours",
         "overtimeHours",
       ],
-      bill: ["name", "category", "amountDue", "dueDate", "priority", "repeat"],
+      bill: ["name", "amountDue", "dueDate", "repeat"],
     }[type] || [];
 
   inputs.forEach((name) => {
@@ -1183,8 +1246,6 @@ function saveEntry(formData) {
       if (tpl) {
         tpl.name = entry.name || tpl.name;
         tpl.amount = Number(entry.amountDue) || tpl.amount;
-        tpl.category = entry.category || tpl.category;
-        tpl.priority = entry.priority || tpl.priority;
         tpl.repeats = entry.repeat || tpl.repeats;
         tpl.autopay = entry.autopay ?? tpl.autopay;
         if (entry.dueDate) {
@@ -1278,6 +1339,7 @@ function deletePaycheck(id) {
 function payBill(id) {
   const bill = state.bills.find((item) => item.id === id);
   if (!bill) return;
+  if (bill.status === "paid" || remainingBill(bill) <= 0) return;
   const amount = remainingBill(bill);
   // mark this instance paid
   bill.paidAmount = Number(bill.amountDue);
@@ -1298,20 +1360,30 @@ function payBill(id) {
     const tpl = state.billTemplates.find((t) => t.id === bill.billTemplateId);
     if (tpl && tpl.repeats === "monthly") {
       const nextDue = addMonthsKeepingDay(bill.dueDate, 1);
-      const nextInstance = {
-        id: crypto.randomUUID(),
-        billTemplateId: tpl.id,
-        name: tpl.name,
-        amountDue: Number(tpl.amount) || 0,
-        dueDate: nextDue,
-        paidAmount: 0,
-        status: "unpaid",
-        category: tpl.category,
-        priority: tpl.priority,
-      };
-      state.bills.push(nextInstance);
+      const alreadyExists = state.bills.some(
+        (item) =>
+          item.billTemplateId === tpl.id &&
+          item.dueDate === nextDue &&
+          remainingBill(item) > 0,
+      );
+
+      if (!alreadyExists) {
+        state.bills.push({
+          id: crypto.randomUUID(),
+          billTemplateId: tpl.id,
+          name: tpl.name,
+          amountDue: Number(tpl.amount) || 0,
+          dueDate: nextDue,
+          paidAmount: 0,
+          status: "unpaid",
+          category: tpl.category,
+          priority: tpl.priority,
+        });
+      }
     }
   }
+
+  cleanupDuplicateBills();
 
   saveState();
   render();
@@ -1389,7 +1461,7 @@ function scheduleNextPaycheck(paycheck) {
   );
 }
 
-function saveSettings() {
+function saveSettingsForm() {
   state.currentCash = Number(document.querySelector("#settingCash").value);
   state.emergencyBuffer = Number(
     document.querySelector("#settingBuffer").value,
