@@ -24,7 +24,50 @@
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <div class="app-shell">
+    <section id="authGate" class="auth-gate">
+      <div class="auth-card">
+        <div class="brand auth-brand">
+          <div class="brand-mark">M</div>
+          <div>
+            <p>MoneyOS</p>
+            <span>Supabase Login</span>
+          </div>
+        </div>
+        <h1>Sign in to test login</h1>
+        <p class="muted auth-copy">
+          Use email and password with Supabase Auth. Create an account first,
+          then sign in to load your own data.
+        </p>
+
+        <form id="authForm" class="auth-form">
+          <label>
+            Email
+            <input id="authEmail" type="email" autocomplete="email" required />
+          </label>
+          <label>
+            Password
+            <input
+              id="authPassword"
+              type="password"
+              autocomplete="current-password"
+              minlength="6"
+              required
+            />
+          </label>
+          <div class="auth-actions">
+            <button class="secondary-button" id="authSignUpBtn" type="button">
+              Create account
+            </button>
+            <button class="primary-button" id="authSignInBtn" type="submit">
+              Sign in
+            </button>
+          </div>
+          <p id="authStatus" class="auth-status muted"></p>
+        </form>
+      </div>
+    </section>
+
+    <div class="app-shell hidden" id="appShell">
       <aside class="sidebar" id="sidebar" aria-label="MoneyOS navigation">
         <div class="brand">
           <div class="brand-mark">M</div>
@@ -57,6 +100,9 @@
             <button class="primary-button" id="quickAddBtn" type="button">
               Add Item
             </button>
+            <button class="secondary-button" id="signOutBtn" type="button">
+              Sign out
+            </button>
           </div>
         </header>
 
@@ -83,13 +129,14 @@
 
         <label>
           Type
-          <select id="entryType" name="entryType">
-            <option value="paycheck">Paycheck</option>
-            <option value="bill">Bill</option>
-            <option value="debt">Debt</option>
-            <option value="budget">Budget Category</option>
-            <option value="saving">Savings Goal</option>
-            <option value="expense">Expense</option>
+            <select id="entryType" name="entryType">
+              <option value="paycheck">Paycheck</option>
+              <option value="mobileJob">Mobile Mechanic Job</option>
+              <option value="bill">Bill</option>
+              <option value="debt">Debt</option>
+              <option value="budget">Budget Category</option>
+              <option value="saving">Savings Goal</option>
+              <option value="expense">Expense</option>
           </select>
         </label>
 
@@ -118,6 +165,8 @@
       </form>
     </dialog>
 
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+    <script src="./supabase-config.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

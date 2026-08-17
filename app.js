@@ -1,12 +1,22 @@
 const storageKey = "moneyos-state-v2";
+const supabaseStateTable = "moneyos_state";
+const supabaseStateRowId = "default";
+const bypassSupabaseAuth = true;
+const supabaseUrl = window.SUPABASE_URL || "";
+const supabaseAnonKey = window.SUPABASE_ANON_KEY || "";
+const supabaseClient =
+  supabaseUrl && supabaseAnonKey && window.supabase
+    ? window.supabase.createClient(supabaseUrl, supabaseAnonKey)
+    : null;
 
 const tabs = [
   { id: "Dashboard", short: "Home" },
   { id: "Paychecks", short: "Pay" },
+  { id: "Mobile Mechanic", short: "Jobs" },
   { id: "Bills", short: "Bills" },
+  { id: "Savings", short: "Save" },
   { id: "Debts", short: "Debt" },
   { id: "Budget", short: "Spend" },
-  { id: "Savings", short: "Save" },
   { id: "Calendar", short: "Cal" },
   { id: "Reports", short: "Stats" },
   { id: "Settings", short: "Set" },
@@ -26,19 +36,30 @@ const seedState = {
   bills: [],
   billTemplates: [],
   debts: [],
+  users: [],
   budgetCategories: [],
   savingsGoals: [],
+  mobileJobs: [],
   expenses: [],
   payments: [],
 };
 
-let state = loadState();
+let state = structuredClone(seedState);
 let activeTab = "Dashboard";
+let currentSession = null;
 
 const navTabs = document.querySelector("#navTabs");
 const content = document.querySelector("#content");
 const pageTitle = document.querySelector("#pageTitle");
 const quickAddBtn = document.querySelector("#quickAddBtn");
+const signOutBtn = document.querySelector("#signOutBtn");
+const appShell = document.querySelector("#appShell");
+const authGate = document.querySelector("#authGate");
+const authForm = document.querySelector("#authForm");
+const authEmail = document.querySelector("#authEmail");
+const authPassword = document.querySelector("#authPassword");
+const authStatus = document.querySelector("#authStatus");
+const authSignUpBtn = document.querySelector("#authSignUpBtn");
 const entryDialog = document.querySelector("#entryDialog");
 const entryForm = document.querySelector("#entryForm");
 const entryType = document.querySelector("#entryType");
@@ -58,15 +79,62 @@ todayLabel.textContent = formatDate(today, {
   day: "numeric",
 });
 
-function loadState() {
+async function loadState() {
   const stored = localStorage.getItem(storageKey);
   const parsed = stored ? JSON.parse(stored) : structuredClone(seedState);
-  const normalized = normalizeState(parsed);
-  return normalized;
+  const localState = normalizeState(parsed);
+  const remoteState = await loadStateFromSupabase();
+
+  if (remoteState) {
+    const normalizedRemote = normalizeState(remoteState);
+    localStorage.setItem(storageKey, JSON.stringify(normalizedRemote));
+    return normalizedRemote;
+  }
+
+  return getSupabaseStateId() ? structuredClone(seedState) : localState;
 }
-// perform migration after `state` is initialized to avoid TDZ issues
-migrateBillsToTemplatesIfNeeded();
-cleanupDuplicateBills();
+
+function getSupabaseStateId() {
+  return currentSession?.user?.id || null;
+}
+
+async function loadStateFromSupabase() {
+  if (!supabaseClient) return null;
+  const stateId = getSupabaseStateId();
+  if (!stateId) return null;
+
+  const { data, error } = await supabaseClient
+    .from(supabaseStateTable)
+    .select("state")
+    .eq("id", stateId)
+    .maybeSingle();
+
+  if (error) {
+    console.warn("Supabase load failed:", error.message);
+    return null;
+  }
+
+  return data?.state || null;
+}
+
+async function syncStateToSupabase() {
+  if (!supabaseClient) return;
+  const stateId = getSupabaseStateId();
+  if (!stateId) return;
+
+  const { error } = await supabaseClient.from(supabaseStateTable).upsert(
+    {
+      id: stateId,
+      state,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "id" },
+  );
+
+  if (error) {
+    console.warn("Supabase save failed:", error.message);
+  }
+}
 
 function normalizeState(input) {
   const next = { ...structuredClone(seedState), ...(input || {}) };
@@ -89,10 +157,19 @@ function normalizeState(input) {
     : [];
   next.templateProjectionMonths = Number(next.templateProjectionMonths) || 6;
   next.debts = Array.isArray(next.debts) ? next.debts : [];
+  next.users = Array.isArray(next.users) ? next.users : [];
   next.budgetCategories = Array.isArray(next.budgetCategories)
     ? next.budgetCategories
     : [];
   next.savingsGoals = Array.isArray(next.savingsGoals) ? next.savingsGoals : [];
+  next.mobileJobs = Array.isArray(next.mobileJobs)
+    ? next.mobileJobs.map((job) => ({
+        ...job,
+        charged: Number(job.charged) || 0,
+        directCost: Number(job.directCost) || 0,
+        hours: Number(job.hours) || 0,
+      }))
+    : [];
   next.expenses = Array.isArray(next.expenses) ? next.expenses : [];
   next.payments = Array.isArray(next.payments) ? next.payments : [];
   return next;
@@ -100,6 +177,96 @@ function normalizeState(input) {
 
 function saveState() {
   localStorage.setItem(storageKey, JSON.stringify(state));
+  void syncStateToSupabase();
+}
+
+function setAuthStatus(message, tone = "muted") {
+  if (!authStatus) return;
+  authStatus.textContent = message;
+  authStatus.dataset.tone = tone;
+}
+
+function setShellVisibility(authed) {
+  if (bypassSupabaseAuth) {
+    appShell?.classList.remove("hidden");
+    authGate?.classList.add("hidden");
+    signOutBtn?.classList.add("hidden");
+    return;
+  }
+
+  appShell?.classList.toggle("hidden", !authed);
+  authGate?.classList.toggle("hidden", authed);
+  signOutBtn?.classList.toggle("hidden", !authed);
+}
+
+async function handleSessionChange(session) {
+  currentSession = session;
+
+  if (bypassSupabaseAuth) {
+    state = await loadState();
+    migrateBillsToTemplatesIfNeeded();
+    cleanupDuplicateBills();
+    setShellVisibility(true);
+    render();
+    return;
+  }
+
+  if (!session) {
+    state = structuredClone(seedState);
+    setShellVisibility(false);
+    setAuthStatus("Sign in or create an account to test login.");
+    return;
+  }
+
+  setShellVisibility(true);
+  setAuthStatus(
+    `Signed in as ${session.user.email || session.user.id}.`,
+    "good",
+  );
+  state = await loadState();
+  migrateBillsToTemplatesIfNeeded();
+  cleanupDuplicateBills();
+  render();
+}
+
+async function signInWithEmail(createAccount = false) {
+  if (!supabaseClient) {
+    setAuthStatus("Supabase client is not configured.", "danger");
+    return;
+  }
+
+  const email = authEmail?.value.trim();
+  const password = authPassword?.value || "";
+  if (!email || !password) {
+    setAuthStatus("Enter both email and password.", "warning");
+    return;
+  }
+
+  setAuthStatus(
+    createAccount ? "Creating account..." : "Signing in...",
+    "warning",
+  );
+
+  const result = createAccount
+    ? await supabaseClient.auth.signUp({ email, password })
+    : await supabaseClient.auth.signInWithPassword({ email, password });
+
+  if (result.error) {
+    setAuthStatus(result.error.message, "danger");
+    return;
+  }
+
+  if (result.data.session) {
+    await handleSessionChange(result.data.session);
+    return;
+  }
+
+  setAuthStatus(
+    createAccount
+      ? "Account created. If email confirmation is enabled, check your inbox, then sign in."
+      : "Signed in, but no session was returned yet.",
+    "warning",
+  );
 }
 
 function startOfDay(date) {
@@ -295,6 +462,7 @@ function metrics() {
     daysLeft,
     dailyLimit: safeToSpend / daysLeft,
     totalDebt,
+    users: state.users.length,
     paidThisMonth,
     debtFreeMonths:
       state.monthlyDebtTarget > 0
@@ -320,6 +488,44 @@ function utilizationTone(rate) {
   if (rate >= 90) return "red";
   if (rate >= 50) return "yellow";
   return "green";
+}
+
+function mobileJobProfit(job) {
+  return Number(job.charged) - Number(job.directCost || 0);
+}
+
+function currentMonthKey() {
+  return toDateString(today).slice(0, 7);
+}
+
+function mobileJobsThisMonth() {
+  const month = currentMonthKey();
+  return state.mobileJobs.filter(
+    (job) => (job.date || "").slice(0, 7) === month,
+  );
+}
+
+function mobileMechanicMetrics() {
+  const jobs = mobileJobsThisMonth();
+  const completed = jobs.filter((job) => job.status === "completed");
+  const paid = completed.filter((job) => job.paymentStatus === "paid");
+  const revenue = sum(paid, "charged");
+  const costs = sum(paid, "directCost");
+  const profit = revenue - costs;
+  const unpaid = completed
+    .filter((job) => job.paymentStatus !== "paid")
+    .reduce((total, job) => total + Number(job.charged || 0), 0);
+
+  return {
+    jobs,
+    completed,
+    paid,
+    revenue,
+    costs,
+    profit,
+    unpaid,
+    average: paid.length ? profit / paid.length : 0,
+  };
 }
 
 function recommendation() {
@@ -400,12 +606,23 @@ function renderNav() {
 
 function render() {
   pageTitle.textContent = activeTab;
+  quickAddBtn.textContent =
+    {
+      Paychecks: "Add Paycheck",
+      "Mobile Mechanic": "Add Job",
+      Bills: "Add Bill",
+      Debts: "Add Debt",
+      Budget: "Add Budget",
+      Savings: "Add Goal",
+    }[activeTab] || "Add Item";
   renderNav();
   const renderer = {
     Dashboard: renderDashboard,
     Paychecks: renderPaychecks,
+    "Mobile Mechanic": renderMobileMechanic,
     Bills: renderBills,
     Debts: renderDebts,
+    Users: renderUsers,
     Budget: renderBudget,
     Savings: renderSavings,
     Calendar: renderCalendar,
@@ -418,6 +635,7 @@ function render() {
 
 function renderDashboard() {
   const m = metrics();
+  const mechanic = mobileMechanicMetrics();
   const nextText = m.next
     ? `${formatDate(m.next.payDate)} · ${money(m.next.netEstimate)} · ${m.daysLeft} days left`
     : "No paycheck planned";
@@ -429,6 +647,7 @@ function renderDashboard() {
       ${metricCard("Next paycheck", m.next ? formatDate(m.next.payDate) : "None", nextText)}
       ${metricCard("Reserved for next paycheck", money(m.billsDue), `${m.beforeNext.length} items reserved`)}
       ${metricCard("Debt remaining", money(m.totalDebt), `${money(m.paidThisMonth)} paid this month`)}
+      ${metricCard("Mobile job profit", money(mechanic.profit), `${mechanic.completed.length} completed this month`, mechanic.profit > 0 ? "good" : "")}
       ${metricCard("Emergency buffer", money(state.emergencyBuffer), "Protected from safe spending")}
       ${metricCard("Debt-free estimate", estimateDate(m.debtFreeMonths), `${m.debtFreeMonths || 0} months at ${money(state.monthlyDebtTarget)}/mo`)}
     </div>
@@ -449,6 +668,10 @@ function renderDashboard() {
         <div class="list-item">
           <span>Free after bills</span>
           <span class="pill ${m.safeToSpend < 0 ? "red" : "green"}">${money(m.safeToSpend)}</span>
+        </div>
+        <div class="list-item">
+          <span>Mobile mechanic unpaid</span>
+          <span class="pill ${mechanic.unpaid > 0 ? "yellow" : "green"}">${money(mechanic.unpaid)}</span>
         </div>
       </div>
     </section>
@@ -521,6 +744,52 @@ function renderPaychecks() {
       )
       .join(""),
   );
+}
+
+function renderMobileMechanic() {
+  const mechanic = mobileMechanicMetrics();
+  const rows = state.mobileJobs
+    .slice()
+    .sort((a, b) => (b.date || "").localeCompare(a.date || ""))
+    .map(
+      (job) => `
+      <div class="list-item mobile-job-item">
+        <div>
+          <strong>${job.title || "Mobile job"}${job.vehicle ? ` · ${job.vehicle}` : ""}</strong>
+          <div class="pill-row">
+            <span class="pill green">${money(mobileJobProfit(job))} profit</span>
+            <span class="pill">${money(job.charged)} charged</span>
+            <span class="pill yellow">${money(job.directCost)} cost</span>
+            <span class="pill blue">${formatDate(job.date)}</span>
+            <span class="pill ${job.paymentStatus === "paid" ? "green" : "red"}">${job.paymentStatus || "unpaid"}</span>
+          </div>
+          <p class="mobile-job-note">${[job.customer, job.serviceCategory, job.notes].filter(Boolean).join(" · ")}</p>
+        </div>
+        <div class="row-actions">
+          ${job.paymentStatus !== "paid" ? `<button class="tiny-button" data-collect-mobile-job="${job.id}" type="button">Collect</button>` : ""}
+          <button class="tiny-button" data-delete-mobile-job="${job.id}" type="button">Delete</button>
+        </div>
+      </div>
+    `,
+    )
+    .join("");
+
+  return `
+    <div class="dashboard-grid">
+      ${metricCard("Job profit", money(mechanic.profit), "Paid completed jobs", "hero-card good")}
+      ${metricCard("Revenue", money(mechanic.revenue), "Money collected")}
+      ${metricCard("Direct costs", money(mechanic.costs), "Parts, gas, supplies")}
+      ${metricCard("Unpaid jobs", money(mechanic.unpaid), "Need follow-up", mechanic.unpaid > 0 ? "warn" : "")}
+      ${metricCard("Completed", String(mechanic.completed.length), "This month")}
+      ${metricCard("Average profit", money(mechanic.average), "Per paid job")}
+    </div>
+    ${panel(
+      "Mobile Mechanic Jobs",
+      "Add Job",
+      "mobileJob",
+      rows || emptyState("No mobile jobs yet. Add a job after each repair."),
+    )}
+  `;
 }
 
 function renderBills() {
@@ -654,6 +923,37 @@ function renderDebts() {
   `;
 }
 
+function renderUsers() {
+  const rows = state.users
+    .slice()
+    .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
+    .map(
+      (user) => `
+      <div class="list-item">
+        <div>
+          <strong>${user.name || "Unnamed user"}</strong>
+          <div class="pill-row">
+            <span class="pill green">${user.role || "Member"}</span>
+            <span class="pill blue">${user.email || "No email"}</span>
+          </div>
+        </div>
+        <div class="row-actions">
+          <button class="tiny-button" data-edit-user="${user.id}" type="button">Edit</button>
+          <button class="tiny-button" data-delete-user="${user.id}" type="button">Delete</button>
+        </div>
+      </div>
+    `,
+    )
+    .join("");
+
+  return panel(
+    "Users",
+    "Add User",
+    "user",
+    rows || emptyState("No users yet. Add one to get started."),
+  );
+}
+
 function renderBudget() {
   const rows = state.budgetCategories
     .map((category) => {
@@ -728,6 +1028,12 @@ function renderCalendar() {
       amount: paycheck.actualNet || paycheck.netEstimate,
       type: "Paycheck",
     })),
+    ...state.mobileJobs.map((job) => ({
+      date: job.date,
+      title: job.title || "Mobile job",
+      amount: mobileJobProfit(job),
+      type: "Mobile Job",
+    })),
   ].sort((a, b) => a.date.localeCompare(b.date));
   return panel(
     "Money Calendar",
@@ -737,7 +1043,7 @@ function renderCalendar() {
       .map(
         (item) => `
     <div class="list-item">
-      <div><strong>${formatDate(item.date)} · ${item.title}</strong><div class="pill-row"><span class="pill ${item.type === "Paycheck" ? "green" : "yellow"}">${item.type}</span></div></div>
+      <div><strong>${formatDate(item.date)} · ${item.title}</strong><div class="pill-row"><span class="pill ${item.type === "Paycheck" || item.type === "Mobile Job" ? "green" : "yellow"}">${item.type}</span></div></div>
       <span class="pill">${money(item.amount)}</span>
     </div>
   `,
@@ -747,10 +1053,12 @@ function renderCalendar() {
 }
 
 function renderReports() {
-  const income = sum(
-    state.paychecks.filter((p) => p.status === "received"),
-    (p) => p.actualNet || p.netEstimate,
-  );
+  const mechanic = mobileMechanicMetrics();
+  const income =
+    sum(
+      state.paychecks.filter((p) => p.status === "received"),
+      (p) => p.actualNet || p.netEstimate,
+    ) + mechanic.profit;
   const billsPaid = sum(
     state.payments.filter((payment) => payment.type === "bill"),
     "amount",
@@ -776,6 +1084,7 @@ function renderReports() {
   return `
     <div class="dashboard-grid">
       ${metricCard("Income", money(income), "Current period")}
+      ${metricCard("Mobile profit", money(mechanic.profit), `${mechanic.completed.length} jobs this month`)}
       ${metricCard("Bills paid", money(billsPaid), "Required payments")}
       ${metricCard("Debt paid", money(debtPaid), "Balance attack")}
       ${metricCard("Saved", money(saved), "Goal progress")}
@@ -784,7 +1093,7 @@ function renderReports() {
     </div>
     <section class="recommendation">
       <p class="eyebrow">Monthly readout</p>
-      <p>You paid strong debt this month. Car repairs hit savings, but net progress is still solid if you protect the next paycheck plan.</p>
+      <p>MoneyOS now treats paycheck income and mobile mechanic profit as one plan. Record jobs, protect bills, then push extra cash toward savings or debt.</p>
     </section>
   `;
 }
@@ -862,9 +1171,31 @@ function bindContentActions() {
     );
   });
 
+  document.querySelectorAll("[data-collect-mobile-job]").forEach((button) => {
+    button.addEventListener("click", () =>
+      collectMobileJob(button.dataset.collectMobileJob),
+    );
+  });
+
+  document.querySelectorAll("[data-delete-mobile-job]").forEach((button) => {
+    button.addEventListener("click", () =>
+      deleteMobileJob(button.dataset.deleteMobileJob),
+    );
+  });
+
   document.querySelectorAll("[data-edit-paycheck]").forEach((button) => {
     button.addEventListener("click", () =>
       editPaycheck(button.dataset.editPaycheck),
+    );
+  });
+
+  document.querySelectorAll("[data-edit-user]").forEach((button) => {
+    button.addEventListener("click", () => editUser(button.dataset.editUser));
+  });
+
+  document.querySelectorAll("[data-delete-user]").forEach((button) => {
+    button.addEventListener("click", () =>
+      deleteUser(button.dataset.deleteUser),
     );
   });
 
@@ -888,6 +1219,15 @@ function bindContentActions() {
     }
     if (entryType.value === "bill") {
       deleteTemplate(editingEntryId);
+      editingEntryId = null;
+      entryForm.reset();
+      entryForm.querySelector("#entryEditId")?.remove();
+      setDeleteButtonVisible(false);
+      entryDialog.close();
+      return;
+    }
+    if (entryType.value === "user") {
+      deleteUser(editingEntryId);
       editingEntryId = null;
       entryForm.reset();
       entryForm.querySelector("#entryEditId")?.remove();
@@ -1068,16 +1408,20 @@ function editPaycheck(id) {
 function updateDialogMeta(type, editing = false) {
   const titles = {
     paycheck: "Add Paycheck",
+    mobileJob: "Add Mobile Job",
     bill: "Add Bill",
     debt: "Add Debt",
+    user: "Add User",
     budget: "Add Budget Category",
     saving: "Add Savings Goal",
     expense: "Add Expense",
   };
   const editTitles = {
     paycheck: "Edit Paycheck",
+    mobileJob: "Edit Mobile Job",
     bill: "Edit Bill",
     debt: "Edit Debt",
+    user: "Edit User",
     budget: "Edit Budget Category",
     saving: "Edit Savings Goal",
     expense: "Edit Expense",
@@ -1105,6 +1449,19 @@ function buildForm(type) {
       ["regularHours", "Regular hours", "number", ""],
       ["overtimeHours", "Overtime hours", "number", ""],
     ],
+    mobileJob: [
+      ["title", "Job title", "text", ""],
+      ["date", "Job date", "date", ""],
+      ["charged", "Customer charged", "number", ""],
+      ["directCost", "Direct job costs", "number", ""],
+      ["status", "Status", "select", ""],
+      ["paymentStatus", "Payment status", "select", ""],
+      ["customer", "Customer", "text", ""],
+      ["vehicle", "Vehicle", "text", ""],
+      ["serviceCategory", "Service category", "text", ""],
+      ["hours", "Hours", "number", ""],
+      ["notes", "Notes", "text", ""],
+    ],
     bill: [
       ["name", "Bill name", "text", ""],
       ["amountDue", "Amount due", "number", ""],
@@ -1118,6 +1475,11 @@ function buildForm(type) {
       ["limit", "Credit limit", "number", ""],
       ["minimumPayment", "Minimum payment", "number", ""],
       ["apr", "APR", "number", ""],
+    ],
+    user: [
+      ["name", "Name", "text", ""],
+      ["email", "Email", "email", ""],
+      ["role", "Role", "text", ""],
     ],
     budget: [
       ["name", "Category name", "text", ""],
@@ -1137,24 +1499,60 @@ function buildForm(type) {
       ["date", "Date", "date", ""],
     ],
   }[type];
+  const requiredFields = {
+    mobileJob: [
+      "title",
+      "date",
+      "charged",
+      "directCost",
+      "status",
+      "paymentStatus",
+    ],
+  }[type];
 
   formFields.innerHTML = fields
-    .map(
-      ([name, label, inputType, placeholder]) => `
+    .map(([name, label, inputType, placeholder]) => {
+      const required = requiredFields ? requiredFields.includes(name) : true;
+      return `
     <label>
       ${label}
       ${
         inputType === "select"
-          ? `<select name="${name}" required>
-              <option value="monthly" selected>Monthly</option>
-              <option value="one-time">One-time</option>
-            </select>`
-          : `<input name="${name}" type="${inputType}" ${inputType === "number" ? 'step="0.01"' : ""} placeholder="${placeholder}" required>`
+          ? renderSelectField(name, required)
+          : `<input name="${name}" type="${inputType}" ${inputType === "number" ? 'step="0.01"' : ""} placeholder="${placeholder}" ${required ? "required" : ""}>`
       }
     </label>
-  `,
-    )
+  `;
+    })
     .join("");
+}
+
+function renderSelectField(name, required = true) {
+  const options = {
+    repeat: [
+      ["monthly", "Monthly"],
+      ["one-time", "One-time"],
+    ],
+    status: [
+      ["completed", "Completed"],
+      ["scheduled", "Scheduled"],
+      ["in-progress", "In Progress"],
+      ["lead", "Lead"],
+      ["cancelled", "Cancelled"],
+    ],
+    paymentStatus: [
+      ["paid", "Paid"],
+      ["partial", "Partial"],
+      ["unpaid", "Unpaid"],
+    ],
+  }[name] || [["", "Select"]];
+
+  return `<select name="${name}" ${required ? "required" : ""}>${options
+    .map(
+      ([value, label], index) =>
+        `<option value="${value}" ${index === 0 ? "selected" : ""}>${label}</option>`,
+    )
+    .join("")}</select>`;
 }
 
 function setFormValues(type, entry) {
@@ -1168,6 +1566,7 @@ function setFormValues(type, entry) {
         "overtimeHours",
       ],
       bill: ["name", "amountDue", "dueDate", "repeat"],
+      user: ["name", "email", "role"],
     }[type] || [];
 
   inputs.forEach((name) => {
@@ -1200,6 +1599,9 @@ function saveEntry(formData) {
       [
         "amount",
         "amountDue",
+        "charged",
+        "directCost",
+        "hours",
         "netEstimate",
         "regularHours",
         "overtimeHours",
@@ -1237,6 +1639,14 @@ function saveEntry(formData) {
     } else {
       state.paychecks.push(normalizedPaycheck);
       scheduleNextPaycheck(normalizedPaycheck);
+    }
+  }
+  if (type === "mobileJob") {
+    entry.status = entry.status || "completed";
+    entry.paymentStatus = entry.paymentStatus || "unpaid";
+    state.mobileJobs.push(entry);
+    if (entry.status === "completed" && entry.paymentStatus === "paid") {
+      recordMobileJobIncome(entry);
     }
   }
   if (type === "bill") {
@@ -1278,10 +1688,88 @@ function saveEntry(formData) {
     }
   }
   if (type === "debt") state.debts.push(entry);
+  if (type === "user") {
+    if (editId) {
+      const existing = state.users.find((item) => item.id === editId);
+      if (existing) {
+        Object.assign(existing, { ...entry, id: editId });
+      } else {
+        state.users.push({ ...entry, id: editId });
+      }
+    } else {
+      state.users.push({ ...entry, id: crypto.randomUUID() });
+    }
+  }
   if (type === "budget") state.budgetCategories.push(entry);
   if (type === "saving")
     state.savingsGoals.push({ ...entry, priority: "medium" });
   if (type === "expense") state.expenses.push(entry);
+  saveState();
+  render();
+}
+
+function recordMobileJobIncome(job) {
+  if (job.cashRecorded) return;
+  const amount = mobileJobProfit(job);
+  state.currentCash += amount;
+  job.cashRecorded = true;
+  state.payments.push({
+    id: crypto.randomUUID(),
+    date: job.date || toDateString(today),
+    account: job.title || "Mobile mechanic job",
+    amount,
+    type: "mobileJob",
+  });
+}
+
+function collectMobileJob(id) {
+  const job = state.mobileJobs.find((item) => item.id === id);
+  if (!job) return;
+  job.status = "completed";
+  job.paymentStatus = "paid";
+  recordMobileJobIncome(job);
+  saveState();
+  render();
+}
+
+function deleteMobileJob(id) {
+  const job = state.mobileJobs.find((item) => item.id === id);
+  if (!job) return;
+  if (!confirm(`Delete ${job.title || "this mobile job"}?`)) return;
+  if (job.cashRecorded) {
+    state.currentCash -= mobileJobProfit(job);
+    state.payments = state.payments.filter(
+      (payment) =>
+        !(
+          payment.type === "mobileJob" &&
+          payment.account === (job.title || "Mobile mechanic job") &&
+          payment.date === (job.date || toDateString(today))
+        ),
+    );
+  }
+  state.mobileJobs = state.mobileJobs.filter((item) => item.id !== id);
+  saveState();
+  render();
+}
+
+function editUser(id) {
+  const user = state.users.find((item) => item.id === id);
+  if (!user) return;
+  editingEntryId = id;
+  entryType.value = "user";
+  updateDialogMeta("user", true);
+  buildForm("user");
+  setFormValues("user", user);
+  ensureEditField(id);
+  setDeleteButtonVisible(true);
+  entryDialog.showModal();
+}
+
+function deleteUser(id) {
+  const user = state.users.find((item) => item.id === id);
+  if (!user) return;
+  if (!confirm(`Delete ${user.name || "this user"}?`)) return;
+  state.users = state.users.filter((item) => item.id !== id);
   saveState();
   render();
 }
@@ -1508,7 +1996,32 @@ window.matchMedia("(min-width: 721px)").addEventListener("change", (event) => {
   if (event.matches) setMobileMenu(false);
 });
 
-quickAddBtn.addEventListener("click", () => openDialog("paycheck"));
+quickAddBtn.addEventListener("click", () => {
+  const typeByTab = {
+    Paychecks: "paycheck",
+    "Mobile Mechanic": "mobileJob",
+    Bills: "bill",
+    Debts: "debt",
+    Budget: "budget",
+    Savings: "saving",
+  };
+  openDialog(typeByTab[activeTab] || "paycheck");
+});
+signOutBtn?.addEventListener("click", async () => {
+  if (bypassSupabaseAuth) return;
+  if (!supabaseClient) return;
+  await supabaseClient.auth.signOut();
+});
+
+authForm?.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void signInWithEmail(false);
+});
+
+authSignUpBtn?.addEventListener("click", () => {
+  void signInWithEmail(true);
+});
+
 entryType.addEventListener("change", () => {
   updateDialogMeta(entryType.value);
   buildForm(entryType.value);
@@ -1532,4 +2045,27 @@ entryForm.addEventListener("submit", (event) => {
   entryDialog.close();
 });
 
-render();
+async function initializeApp() {
+  setShellVisibility(true);
+  setAuthStatus("Local mode enabled.");
+
+  state = await loadState();
+  migrateBillsToTemplatesIfNeeded();
+  cleanupDuplicateBills();
+  render();
+
+  if (!supabaseClient) {
+    return;
+  }
+
+  const { data, error } = await supabaseClient.auth.getSession();
+  if (!error && data?.session) {
+    currentSession = data.session;
+  }
+
+  supabaseClient.auth.onAuthStateChange((_event, session) => {
+    void handleSessionChange(session);
+  });
+}
+
+initializeApp();
