@@ -680,7 +680,7 @@ function recommendation() {
     return {
       tone: "good",
       title: "Recommended move",
-      text: `You can wipe out ${smallestDebt.name} with ${money(smallestDebt.balance)} and still have about ${money(m.safeToSpend - smallestDebt.balance)} safe to spend.`,
+      text: `You can wipe out ${smallestDebt.name} with ${money(smallestDebt.balance)} and still have about ${money(m.safeToSpend - smallestDebt.balance)} planned money left.`,
     };
   }
 
@@ -694,8 +694,8 @@ function recommendation() {
 
   return {
     tone: "good",
-    title: "Good move",
-    text: `You have ${money(m.safeToSpend)} safe to spend, about ${money(m.dailyLimit)} per day until the next paycheck.`,
+    title: "Plan check",
+    text: `Your planned money left is ${money(m.safeToSpend)} after bills, savings, debt plans, and buffer. Use your bank app for exact cash.`,
   };
 }
 
@@ -755,12 +755,12 @@ function renderDashboard() {
 
   return `
     <div class="dashboard-grid dashboard-grid-home">
-      ${metricCard("Cash available", money(state.currentCash), "Money on hand", "home-primary")}
+      ${metricCard("Savings", money(savings.current), savingsText, savings.current > 0 ? "home-primary good" : "home-primary")}
       ${metricCard("Next paycheck", m.next ? formatDate(m.next.payDate) : "None", nextText)}
       ${metricCard("Bills due", money(m.billsDue), `${m.beforeNext.length} before payday`)}
       ${metricCard("Mobile jobs", money(mechanic.profit), `${mechanic.completed.length} completed`, mechanic.profit > 0 ? "good" : "")}
-      ${metricCard("Savings", money(savings.current), savingsText, savings.current > 0 ? "good" : "")}
-      ${metricCard("Debt remaining", money(m.totalDebt), `${money(m.paidThisMonth)} paid this month`)}
+      ${metricCard("Debt paid", money(m.paidThisMonth), "This month", m.paidThisMonth > 0 ? "good" : "")}
+      ${metricCard("Debt remaining", money(m.totalDebt), `${state.debts.length} active accounts`)}
     </div>
 
     <section class="table-panel compact-panel">
@@ -779,10 +779,6 @@ function renderDashboard() {
         <div class="list-item">
           <span>Buffer protected</span>
           <span class="pill yellow">${money(state.emergencyBuffer)}</span>
-        </div>
-        <div class="list-item">
-          <span>Debt paid this month</span>
-          <span class="pill blue">${money(m.paidThisMonth)}</span>
         </div>
       </div>
     </section>
@@ -826,7 +822,7 @@ function renderPaycheckPlan() {
       ${planLine("Debt attack", money(state.plannedDebtPayments), "blue")}
       ${planLine("Savings", money(state.plannedSavings), "green")}
       ${planLine("Keep buffer", money(state.emergencyBuffer), "yellow")}
-      ${planLine("Safe spending left", money(m.safeToSpend), m.safeToSpend < 0 ? "red" : "green")}
+      ${planLine("Planned money left", money(m.safeToSpend), m.safeToSpend < 0 ? "red" : "green")}
     </div>
   `;
 }
@@ -1241,7 +1237,7 @@ function renderSettings() {
     <section class="table-panel">
       <div class="panel-head"><h2>Settings</h2></div>
       <div class="form-grid">
-        <label>Current cash<input id="settingCash" type="number" min="0" step="1" value="${state.currentCash}"></label>
+        <label>Manual cash snapshot<input id="settingCash" type="number" min="0" step="1" value="${state.currentCash}"></label>
         <label>Emergency buffer<input id="settingBuffer" type="number" min="0" step="1" value="${state.emergencyBuffer}"></label>
         <label>Planned debt payments<input id="settingDebt" type="number" min="0" step="1" value="${state.plannedDebtPayments}"></label>
         <label>Planned savings<input id="settingSavings" type="number" min="0" step="1" value="${state.plannedSavings}"></label>
@@ -2037,7 +2033,7 @@ function payDebt(id) {
   if (!debt) return;
   const suggestedAmount = Math.min(
     debt.balance,
-    Math.max(debt.minimumPayment || 25, Math.floor(metrics().safeToSpend / 2)),
+    Number(debt.minimumPayment) || debt.balance,
   );
   const requestedAmount = Number(
     prompt("Debt payment amount", String(suggestedAmount || debt.minimumPayment || 25)),
