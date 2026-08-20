@@ -556,6 +556,21 @@ function mobileMechanicMetrics() {
   };
 }
 
+function savingsMetrics() {
+  const current = sum(state.savingsGoals, "current");
+  const target = sum(state.savingsGoals, "target");
+  const remaining = Math.max(0, target - current);
+  const percent = target > 0 ? Math.min(100, (current / target) * 100) : 0;
+
+  return {
+    current,
+    target,
+    remaining,
+    percent,
+    count: state.savingsGoals.length,
+  };
+}
+
 function moneyMoveTone(type) {
   return ["paycheck", "mobileJob"].includes(type) ? "green" : "red";
 }
@@ -730,9 +745,13 @@ function render() {
 function renderDashboard() {
   const m = metrics();
   const mechanic = mobileMechanicMetrics();
+  const savings = savingsMetrics();
   const nextText = m.next
     ? `${formatDate(m.next.payDate)} · ${money(m.next.netEstimate)} · ${m.daysLeft} days left`
     : "No paycheck planned";
+  const savingsText = savings.target
+    ? `${money(savings.remaining)} left of ${money(savings.target)}`
+    : "Add a savings goal";
 
   return `
     <div class="dashboard-grid dashboard-grid-home">
@@ -740,7 +759,7 @@ function renderDashboard() {
       ${metricCard("Next paycheck", m.next ? formatDate(m.next.payDate) : "None", nextText)}
       ${metricCard("Bills due", money(m.billsDue), `${m.beforeNext.length} before payday`)}
       ${metricCard("Mobile jobs", money(mechanic.profit), `${mechanic.completed.length} completed`, mechanic.profit > 0 ? "good" : "")}
-      ${metricCard("Buffer", money(state.emergencyBuffer), "Protected cash")}
+      ${metricCard("Savings", money(savings.current), savingsText, savings.current > 0 ? "good" : "")}
       ${metricCard("Debt remaining", money(m.totalDebt), `${money(m.paidThisMonth)} paid this month`)}
     </div>
 
@@ -756,6 +775,10 @@ function renderDashboard() {
         <div class="list-item">
           <span>Mobile mechanic unpaid</span>
           <span class="pill ${mechanic.unpaid > 0 ? "yellow" : "green"}">${money(mechanic.unpaid)}</span>
+        </div>
+        <div class="list-item">
+          <span>Buffer protected</span>
+          <span class="pill yellow">${money(state.emergencyBuffer)}</span>
         </div>
         <div class="list-item">
           <span>Debt paid this month</span>
@@ -1095,32 +1118,40 @@ function renderBudget() {
 }
 
 function renderSavings() {
-  return panel(
-    "Savings Goals",
-    "Add Goal",
-    "saving",
+  const savings = savingsMetrics();
+  const rows =
     state.savingsGoals
       .map((goal) => {
-        const progress = Math.min(100, (goal.current / goal.target) * 100);
+        const target = Number(goal.target) || 0;
+        const current = Number(goal.current) || 0;
+        const progress = target > 0 ? Math.min(100, (current / target) * 100) : 0;
         const months = monthsUntil(goal.deadline);
-        const needed = months > 0 ? (goal.target - goal.current) / months : 0;
+        const needed = months > 0 ? Math.max(0, target - current) / months : 0;
         return `
       <div class="list-item">
         <div>
           <strong>${goal.name}</strong>
           <div class="pill-row">
-            <span class="pill green">${money(goal.current)} saved</span>
+            <span class="pill green">${money(current)} saved</span>
             <span class="pill">${progress.toFixed(1)}%</span>
             <span class="pill blue">${money(needed)}/mo needed</span>
           </div>
           <div class="progress" style="--progress:${progress}%"><span></span></div>
         </div>
-        <span class="pill">${money(goal.target)}</span>
+        <span class="pill">${money(target)}</span>
       </div>
     `;
       })
-      .join(""),
-  );
+      .join("") || emptyState("No savings goals yet. Add one to start tracking progress.");
+
+  return `
+    <div class="dashboard-grid">
+      ${metricCard("Saved", money(savings.current), `${savings.count} active goals`, savings.current > 0 ? "hero-card good" : "hero-card")}
+      ${metricCard("Left to goals", money(savings.remaining), savings.target ? `of ${money(savings.target)} target` : "Set a target")}
+      ${metricCard("Progress", `${savings.percent.toFixed(0)}%`, "Goal progress")}
+    </div>
+    ${panel("Savings Goals", "Add Goal", "saving", rows)}
+  `;
 }
 
 function renderCalendar() {
@@ -1163,6 +1194,7 @@ function renderCalendar() {
 
 function renderReports() {
   const mechanic = mobileMechanicMetrics();
+  const savings = savingsMetrics();
   const income =
     sum(
       state.paychecks.filter((p) => p.status === "received"),
@@ -1176,10 +1208,7 @@ function renderReports() {
     state.payments.filter((payment) => payment.type === "debt"),
     "amount",
   );
-  const saved = sum(
-    state.payments.filter((payment) => payment.type === "savings"),
-    "amount",
-  );
+  const saved = savings.current;
   const spent = sum(state.expenses, "amount");
   const grade =
     debtPaid > 700 && saved > 250
@@ -2006,10 +2035,15 @@ function payBill(id) {
 function payDebt(id) {
   const debt = state.debts.find((item) => item.id === id);
   if (!debt) return;
-  const amount = Math.min(
+  const suggestedAmount = Math.min(
     debt.balance,
     Math.max(debt.minimumPayment || 25, Math.floor(metrics().safeToSpend / 2)),
   );
+  const requestedAmount = Number(
+    prompt("Debt payment amount", String(suggestedAmount || debt.minimumPayment || 25)),
+  );
+  if (!requestedAmount || requestedAmount <= 0) return;
+  const amount = Math.min(debt.balance, requestedAmount);
   debt.balance = Math.max(0, debt.balance - amount);
   state.currentCash = Math.max(0, state.currentCash - amount);
   state.payments.push({
