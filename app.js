@@ -1,7 +1,6 @@
 const storageKey = "moneyos-state-v2";
 const supabaseStateTable = "moneyos_state";
-const supabaseStateRowId = "default";
-const bypassSupabaseAuth = true;
+const bypassSupabaseAuth = false;
 const supabaseUrl = window.SUPABASE_URL || "";
 const supabaseAnonKey = window.SUPABASE_ANON_KEY || "";
 const supabaseClient =
@@ -19,6 +18,7 @@ const tabs = [
   { id: "Budget", short: "Spend" },
   { id: "Calendar", short: "Cal" },
   { id: "Reports", short: "Stats" },
+  { id: "Users", short: "Users" },
   { id: "Settings", short: "Set" },
 ];
 
@@ -91,7 +91,7 @@ async function loadState() {
     return normalizedRemote;
   }
 
-  return getSupabaseStateId() ? structuredClone(seedState) : localState;
+  return localState;
 }
 
 function getSupabaseStateId() {
@@ -186,6 +186,32 @@ function setAuthStatus(message, tone = "muted") {
   authStatus.dataset.tone = tone;
 }
 
+function signedInEmail() {
+  return currentSession?.user?.email || "";
+}
+
+function ensureSignedInUserRecord() {
+  const user = currentSession?.user;
+  if (!user) return;
+
+  const existing = state.users.find(
+    (item) => item.authUserId === user.id || item.email === user.email,
+  );
+  const profile = {
+    authUserId: user.id,
+    name: existing?.name || user.email?.split("@")[0] || "Account owner",
+    email: user.email || existing?.email || "",
+    role: existing?.role || "Owner",
+    lastSeen: new Date().toISOString(),
+  };
+
+  if (existing) {
+    Object.assign(existing, profile, { id: existing.id });
+  } else {
+    state.users.push({ ...profile, id: crypto.randomUUID() });
+  }
+}
+
 function setShellVisibility(authed) {
   if (bypassSupabaseAuth) {
     appShell?.classList.remove("hidden");
@@ -214,7 +240,7 @@ async function handleSessionChange(session) {
   if (!session) {
     state = structuredClone(seedState);
     setShellVisibility(false);
-    setAuthStatus("Sign in or create an account to test login.");
+    setAuthStatus("Sign in or create an account to sync across devices.");
     return;
   }
 
@@ -224,8 +250,10 @@ async function handleSessionChange(session) {
     "good",
   );
   state = await loadState();
+  ensureSignedInUserRecord();
   migrateBillsToTemplatesIfNeeded();
   cleanupDuplicateBills();
+  saveState();
   render();
 }
 
@@ -263,7 +291,7 @@ async function signInWithEmail(createAccount = false) {
 
   setAuthStatus(
     createAccount
-      ? "Account created. If email confirmation is enabled, check your inbox, then sign in."
+      ? "Account created. If email confirmation is on, check your inbox, then sign in."
       : "Signed in, but no session was returned yet.",
     "warning",
   );
@@ -528,6 +556,71 @@ function mobileMechanicMetrics() {
   };
 }
 
+function moneyMoveTone(type) {
+  return ["paycheck", "mobileJob"].includes(type) ? "green" : "red";
+}
+
+function moneyMoveAmount(move) {
+  const sign = ["paycheck", "mobileJob"].includes(move.type) ? 1 : -1;
+  return sign * Number(move.amount || 0);
+}
+
+function moneyMoveLabel(type) {
+  return {
+    paycheck: "Paycheck",
+    bill: "Bill paid",
+    debt: "Debt paid",
+    mobileJob: "Job collected",
+    expense: "Expense",
+  }[type] || "Money move";
+}
+
+function recentMoneyMoves(limit = 5) {
+  const paymentMoves = state.payments.map((payment) => ({
+    id: payment.id,
+    date: payment.date,
+    account: payment.account,
+    amount: Number(payment.amount) || 0,
+    type: payment.type,
+  }));
+  const paycheckMoves = state.paychecks
+    .filter((paycheck) => paycheck.status === "received")
+    .map((paycheck) => ({
+      id: `paycheck-${paycheck.id}`,
+      date: paycheck.payDate,
+      account: paycheck.employer || "Paycheck",
+      amount: Number(paycheck.actualNet || paycheck.netEstimate) || 0,
+      type: "paycheck",
+    }));
+
+  return [...paymentMoves, ...paycheckMoves]
+    .filter((move) => move.date && move.amount)
+    .sort((a, b) => b.date.localeCompare(a.date))
+    .slice(0, limit);
+}
+
+function renderMoneyMoves() {
+  const moves = recentMoneyMoves();
+  if (!moves.length) {
+    return emptyState("No money moves yet. Payments and collected jobs will show here.");
+  }
+
+  return moves
+    .map((move) => {
+      const amount = moneyMoveAmount(move);
+      return `
+        <div class="list-item money-move">
+          <div>
+            <strong>${moneyMoveLabel(move.type)}</strong>
+            <span>${formatDate(move.date)} · ${move.account || "MoneyOS"}</span>
+          </div>
+          <span class="pill ${moneyMoveTone(move.type)}">${amount > 0 ? "+" : "-"}${money(Math.abs(amount))}</span>
+        </div>
+      `;
+    })
+    .join("");
+}
+
 function recommendation() {
   const m = metrics();
   if (
@@ -614,6 +707,7 @@ function render() {
       Debts: "Add Debt",
       Budget: "Add Budget",
       Savings: "Add Goal",
+      Users: "Add User",
     }[activeTab] || "Add Item";
   renderNav();
   const renderer = {
@@ -641,38 +735,41 @@ function renderDashboard() {
     : "No paycheck planned";
 
   return `
-    <div class="dashboard-grid">
-      ${metricCard("Current cash", money(state.currentCash), "Manual cash available", "hero-card")}
-      ${metricCard("Safe to spend", money(m.safeToSpend), `${money(m.dailyLimit)} per day`, `hero-card ${m.safeToSpend < 0 ? "danger" : m.safeToSpend < 150 ? "warn" : "good"}`)}
+    <div class="dashboard-grid dashboard-grid-home">
+      ${metricCard("Cash available", money(state.currentCash), "Money on hand", "home-primary")}
       ${metricCard("Next paycheck", m.next ? formatDate(m.next.payDate) : "None", nextText)}
-      ${metricCard("Reserved for next paycheck", money(m.billsDue), `${m.beforeNext.length} items reserved`)}
+      ${metricCard("Bills due", money(m.billsDue), `${m.beforeNext.length} before payday`)}
+      ${metricCard("Mobile jobs", money(mechanic.profit), `${mechanic.completed.length} completed`, mechanic.profit > 0 ? "good" : "")}
+      ${metricCard("Buffer", money(state.emergencyBuffer), "Protected cash")}
       ${metricCard("Debt remaining", money(m.totalDebt), `${money(m.paidThisMonth)} paid this month`)}
-      ${metricCard("Mobile job profit", money(mechanic.profit), `${mechanic.completed.length} completed this month`, mechanic.profit > 0 ? "good" : "")}
-      ${metricCard("Emergency buffer", money(state.emergencyBuffer), "Protected from safe spending")}
-      ${metricCard("Debt-free estimate", estimateDate(m.debtFreeMonths), `${m.debtFreeMonths || 0} months at ${money(state.monthlyDebtTarget)}/mo`)}
     </div>
 
-    <section class="table-panel">
+    <section class="table-panel compact-panel">
       <div class="panel-head">
-        <h2>At a glance</h2>
+        <h2>Today</h2>
       </div>
-      <div class="item-list">
+      <div class="item-list compact-list">
         <div class="list-item">
-          <span>Next paycheck</span>
-          <span class="pill green">${m.next ? formatDate(m.next.payDate) : "None"}</span>
-        </div>
-        <div class="list-item">
-          <span>Reserved for next paycheck</span>
-          <span class="pill yellow">${money(m.billsDue)}</span>
-        </div>
-        <div class="list-item">
-          <span>Free after bills</span>
-          <span class="pill ${m.safeToSpend < 0 ? "red" : "green"}">${money(m.safeToSpend)}</span>
+          <span>${m.next ? "Next paycheck" : "Add your next paycheck"}</span>
+          <span class="pill green">${m.next ? formatDate(m.next.payDate) : "Start"}</span>
         </div>
         <div class="list-item">
           <span>Mobile mechanic unpaid</span>
           <span class="pill ${mechanic.unpaid > 0 ? "yellow" : "green"}">${money(mechanic.unpaid)}</span>
         </div>
+        <div class="list-item">
+          <span>Debt paid this month</span>
+          <span class="pill blue">${money(m.paidThisMonth)}</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="table-panel compact-panel">
+      <div class="panel-head">
+        <h2>Money Moves</h2>
+      </div>
+      <div class="item-list compact-list money-moves-list">
+        ${renderMoneyMoves()}
       </div>
     </section>
   `;
@@ -891,6 +988,7 @@ function renderDebts() {
   return `
     <div class="dashboard-grid">
       ${metricCard("Total debt", money(m.totalDebt), `${state.debts.length} active accounts`, "hero-card")}
+      ${metricCard("Debt-free estimate", estimateDate(m.debtFreeMonths), `${m.debtFreeMonths || 0} months at ${money(state.monthlyDebtTarget)}/mo`)}
       ${metricCard("Paid this month", money(m.paidThisMonth), `Target ${money(state.monthlyDebtTarget)}`)}
       ${metricCard("Minimums", money(sum(state.debts, "minimumPayment")), "Monthly required payments")}
       ${metricCard("Best payoff", [...state.debts].sort((a, b) => a.balance - b.balance)[0]?.name || "None", "Hybrid: small payoff first")}
@@ -924,6 +1022,7 @@ function renderDebts() {
 }
 
 function renderUsers() {
+  const account = signedInEmail() || "Not signed in";
   const rows = state.users
     .slice()
     .sort((a, b) => (a.name || "").localeCompare(b.name || ""))
@@ -935,6 +1034,7 @@ function renderUsers() {
           <div class="pill-row">
             <span class="pill green">${user.role || "Member"}</span>
             <span class="pill blue">${user.email || "No email"}</span>
+            ${user.authUserId ? `<span class="pill">Can sign in</span>` : `<span class="pill yellow">Profile only</span>`}
           </div>
         </div>
         <div class="row-actions">
@@ -946,12 +1046,21 @@ function renderUsers() {
     )
     .join("");
 
-  return panel(
-    "Users",
-    "Add User",
-    "user",
-    rows || emptyState("No users yet. Add one to get started."),
-  );
+  return `
+    <section class="recommendation">
+      <p class="eyebrow">Cloud account</p>
+      <p>${supabaseClient ? `Signed in as ${account}. This account can load the same MoneyOS data from another phone or browser after signing in.` : "Add your Supabase URL and anon key in supabase-config.js to turn on cloud sign-in."}</p>
+    </section>
+    ${panel(
+      "Users",
+      "Add User",
+      "user",
+      rows ||
+        emptyState(
+          "No users yet. Sign in or add a user profile to get started.",
+        ),
+    )}
+  `;
 }
 
 function renderBudget() {
@@ -1114,6 +1223,23 @@ function renderSettings() {
         <input id="importDataInput" type="file" accept="application/json" hidden>
         <button class="secondary-button" id="resetData" type="button">Clear all data</button>
         <button class="primary-button" id="saveSettings" type="button">Save Settings</button>
+      </div>
+    </section>
+    <section class="table-panel">
+      <div class="panel-head"><h2>Cloud Access</h2></div>
+      <div class="item-list">
+        <div class="list-item">
+          <span>Signed-in account</span>
+          <span class="pill ${currentSession ? "green" : "yellow"}">${signedInEmail() || "Not signed in"}</span>
+        </div>
+        <div class="list-item">
+          <span>Cloud sync</span>
+          <span class="pill ${supabaseClient ? "green" : "red"}">${supabaseClient ? "Ready" : "Needs config"}</span>
+        </div>
+        <div class="list-item">
+          <span>User profiles</span>
+          <span class="pill blue">${state.users.length}</span>
+        </div>
       </div>
     </section>
   `;
@@ -2046,21 +2172,27 @@ entryForm.addEventListener("submit", (event) => {
 });
 
 async function initializeApp() {
-  setShellVisibility(true);
-  setAuthStatus("Local mode enabled.");
-
-  state = await loadState();
-  migrateBillsToTemplatesIfNeeded();
-  cleanupDuplicateBills();
-  render();
-
   if (!supabaseClient) {
+    setShellVisibility(false);
+    setAuthStatus(
+      "Cloud login needs Supabase settings in supabase-config.js.",
+      "danger",
+    );
     return;
   }
 
   const { data, error } = await supabaseClient.auth.getSession();
-  if (!error && data?.session) {
-    currentSession = data.session;
+  if (error) {
+    setShellVisibility(false);
+    setAuthStatus(error.message, "danger");
+    return;
+  }
+
+  if (data?.session) {
+    await handleSessionChange(data.session);
+  } else {
+    setShellVisibility(false);
+    setAuthStatus("Sign in or create an account to sync across devices.");
   }
 
   supabaseClient.auth.onAuthStateChange((_event, session) => {
