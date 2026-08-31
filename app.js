@@ -3,6 +3,7 @@ const supabaseStateTable = "moneyos_state";
 const bypassSupabaseAuth = false;
 const supabaseUrl = window.SUPABASE_URL || "";
 const supabaseAnonKey = window.SUPABASE_ANON_KEY || "";
+let vapidPublicKey = window.MONEYOS_VAPID_PUBLIC_KEY || "";
 const supabaseClient =
   supabaseUrl && supabaseAnonKey && window.supabase
     ? window.supabase.createClient(supabaseUrl, supabaseAnonKey)
@@ -42,6 +43,13 @@ const seedState = {
   mobileJobs: [],
   expenses: [],
   payments: [],
+  notificationSettings: {
+    enabled: false,
+    billReminders: true,
+    savingsReminders: true,
+    reminderWindowDays: 1,
+    pushSubscriptions: [],
+  },
 };
 
 let state = structuredClone(seedState);
@@ -172,12 +180,161 @@ function normalizeState(input) {
     : [];
   next.expenses = Array.isArray(next.expenses) ? next.expenses : [];
   next.payments = Array.isArray(next.payments) ? next.payments : [];
+  next.notificationSettings = {
+    ...seedState.notificationSettings,
+    ...(next.notificationSettings || {}),
+  };
+  next.notificationSettings.pushSubscriptions = Array.isArray(
+    next.notificationSettings.pushSubscriptions,
+  )
+    ? next.notificationSettings.pushSubscriptions
+    : [];
   return next;
 }
 
 function saveState() {
   localStorage.setItem(storageKey, JSON.stringify(state));
   void syncStateToSupabase();
+}
+
+function notificationSupport() {
+  const supported =
+    "serviceWorker" in navigator &&
+    "PushManager" in window &&
+    "Notification" in window &&
+    (window.isSecureContext || location.hostname === "localhost");
+  const installed =
+    window.matchMedia?.("(display-mode: standalone)")?.matches ||
+    window.navigator.standalone === true;
+
+  return { supported, installed };
+}
+
+function notificationStatusLabel() {
+  const { supported, installed } = notificationSupport();
+  if (!supported) return { text: "Not supported", tone: "red" };
+  if (!vapidPublicKey) return { text: "Needs push key", tone: "yellow" };
+  if (
+    Notification.permission === "granted" &&
+    state.notificationSettings.enabled
+  ) {
+    return { text: "On", tone: "green" };
+  }
+  if (Notification.permission === "denied")
+    return { text: "Blocked", tone: "red" };
+  if (!installed) return { text: "Install first", tone: "yellow" };
+  return { text: "Ready", tone: "blue" };
+}
+
+function urlBase64ToUint8Array(value) {
+  const padding = "=".repeat((4 - (value.length % 4)) % 4);
+  const base64 = `${value}${padding}`.replace(/-/g, "+").replace(/_/g, "/");
+  const raw = window.atob(base64);
+  return Uint8Array.from([...raw].map((char) => char.charCodeAt(0)));
+}
+
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return null;
+  try {
+    return await navigator.serviceWorker.register("./sw.js");
+  } catch (error) {
+    console.warn("Service worker registration failed:", error);
+    return null;
+  }
+}
+
+async function getVapidPublicKey() {
+  if (vapidPublicKey) return vapidPublicKey;
+  try {
+    const response = await fetch("/.netlify/functions/push-public-key");
+    if (!response.ok) return "";
+    const data = await response.json();
+    vapidPublicKey = data.publicKey || "";
+    return vapidPublicKey;
+  } catch {
+    return "";
+  }
+}
+
+async function savePushSubscription(subscription) {
+  if (!currentSession || !supabaseClient) {
+    throw new Error("Sign in before turning on reminders.");
+  }
+
+  const { data, error } = await supabaseClient.auth.getSession();
+  const accessToken = data?.session?.access_token;
+  if (error || !accessToken) {
+    throw new Error(error?.message || "Missing cloud session.");
+  }
+
+  const response = await fetch("/.netlify/functions/save-push-subscription", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+    },
+    body: JSON.stringify({
+      subscription,
+      settings: {
+        billReminders: true,
+        savingsReminders: true,
+        reminderWindowDays: 1,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error || "Could not save notification device.");
+  }
+}
+
+async function enableNotifications() {
+  const { supported, installed } = notificationSupport();
+  if (!supported) {
+    alert("This browser cannot receive MoneyOS push reminders.");
+    return;
+  }
+  if (!installed) {
+    alert("Open MoneyOS from your iPhone Home Screen, then tap this again.");
+    return;
+  }
+  const publicKey = await getVapidPublicKey();
+  if (!publicKey) {
+    alert(
+      "Add MONEYOS_VAPID_PUBLIC_KEY to supabase-config.js and Netlify first.",
+    );
+    return;
+  }
+
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") {
+    render();
+    return;
+  }
+
+  const registration = await registerServiceWorker();
+  if (!registration) return;
+
+  const existing = await registration.pushManager.getSubscription();
+  const subscription =
+    existing ||
+    (await registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(publicKey),
+    }));
+
+  await savePushSubscription(subscription.toJSON());
+  state.notificationSettings = {
+    ...state.notificationSettings,
+    enabled: true,
+    billReminders: true,
+    savingsReminders: true,
+    reminderWindowDays: 1,
+  };
+  saveState();
+  render();
+  alert("MoneyOS reminders are on for this device.");
 }
 
 function setAuthStatus(message, tone = "muted") {
@@ -428,24 +585,13 @@ function cleanupDuplicateBills() {
 function billsBeforeNextPaycheck() {
   const next = getNextPaycheck();
   if (!next) return [];
-  const paychecks = [...state.paychecks].sort((a, b) =>
-    a.payDate.localeCompare(b.payDate),
-  );
-  if (paychecks.length === 0) return [];
 
   return state.bills
     .filter((bill) => remainingBill(bill) > 0)
     .filter((bill) => {
-      // find the paycheck that occurs immediately before the bill's due date
-      let assigned = null;
-      for (let i = 0; i < paychecks.length; i++) {
-        const p = paychecks[i];
-        if (p.payDate <= bill.dueDate) assigned = p;
-        else break;
-      }
-      // if no prior paycheck found, assign to the next upcoming paycheck
-      if (!assigned) assigned = next;
-      return assigned && assigned.id === next.id;
+      const billDate = startOfDay(new Date(`${bill.dueDate}T12:00:00`));
+      const nextPayDate = startOfDay(new Date(`${next.payDate}T12:00:00`));
+      return billDate <= nextPayDate;
     })
     .sort((a, b) => a.dueDate.localeCompare(b.dueDate));
 }
@@ -581,13 +727,15 @@ function moneyMoveAmount(move) {
 }
 
 function moneyMoveLabel(type) {
-  return {
-    paycheck: "Paycheck",
-    bill: "Bill paid",
-    debt: "Debt paid",
-    mobileJob: "Job collected",
-    expense: "Expense",
-  }[type] || "Money move";
+  return (
+    {
+      paycheck: "Paycheck",
+      bill: "Bill paid",
+      debt: "Debt paid",
+      mobileJob: "Job collected",
+      expense: "Expense",
+    }[type] || "Money move"
+  );
 }
 
 function recentMoneyMoves(limit = 5) {
@@ -617,7 +765,9 @@ function recentMoneyMoves(limit = 5) {
 function renderMoneyMoves() {
   const moves = recentMoneyMoves();
   if (!moves.length) {
-    return emptyState("No money moves yet. Payments and collected jobs will show here.");
+    return emptyState(
+      "No money moves yet. Payments and collected jobs will show here.",
+    );
   }
 
   return moves
@@ -1120,7 +1270,8 @@ function renderSavings() {
       .map((goal) => {
         const target = Number(goal.target) || 0;
         const current = Number(goal.current) || 0;
-        const progress = target > 0 ? Math.min(100, (current / target) * 100) : 0;
+        const progress =
+          target > 0 ? Math.min(100, (current / target) * 100) : 0;
         const months = monthsUntil(goal.deadline);
         const needed = months > 0 ? Math.max(0, target - current) / months : 0;
         return `
@@ -1138,7 +1289,8 @@ function renderSavings() {
       </div>
     `;
       })
-      .join("") || emptyState("No savings goals yet. Add one to start tracking progress.");
+      .join("") ||
+    emptyState("No savings goals yet. Add one to start tracking progress.");
 
   return `
     <div class="dashboard-grid">
@@ -1233,6 +1385,7 @@ function renderReports() {
 }
 
 function renderSettings() {
+  const notificationStatus = notificationStatusLabel();
   return `
     <section class="table-panel">
       <div class="panel-head"><h2>Settings</h2></div>
@@ -1248,6 +1401,26 @@ function renderSettings() {
         <input id="importDataInput" type="file" accept="application/json" hidden>
         <button class="secondary-button" id="resetData" type="button">Clear all data</button>
         <button class="primary-button" id="saveSettings" type="button">Save Settings</button>
+      </div>
+    </section>
+    <section class="table-panel">
+      <div class="panel-head"><h2>Reminders</h2></div>
+      <div class="item-list">
+        <div class="list-item">
+          <span>iPhone reminders</span>
+          <span class="pill ${notificationStatus.tone}">${notificationStatus.text}</span>
+        </div>
+        <div class="list-item">
+          <span>Bills due soon</span>
+          <span class="pill blue">Today + tomorrow</span>
+        </div>
+        <div class="list-item">
+          <span>Savings progress</span>
+          <span class="pill blue">Weekly</span>
+        </div>
+      </div>
+      <div class="dialog-actions" style="margin-top:16px">
+        <button class="primary-button" id="enableNotifications" type="button">Turn On Reminders</button>
       </div>
     </section>
     <section class="table-panel">
@@ -1390,6 +1563,11 @@ function bindContentActions() {
   document
     .querySelector("#saveSettings")
     ?.addEventListener("click", saveSettingsForm);
+  document
+    .querySelector("#enableNotifications")
+    ?.addEventListener("click", () => {
+      void enableNotifications().catch((error) => alert(error.message));
+    });
   document.querySelector("#exportData")?.addEventListener("click", exportData);
   document
     .querySelector("#importDataInput")
@@ -2036,7 +2214,10 @@ function payDebt(id) {
     Number(debt.minimumPayment) || debt.balance,
   );
   const requestedAmount = Number(
-    prompt("Debt payment amount", String(suggestedAmount || debt.minimumPayment || 25)),
+    prompt(
+      "Debt payment amount",
+      String(suggestedAmount || debt.minimumPayment || 25),
+    ),
   );
   if (!requestedAmount || requestedAmount <= 0) return;
   const amount = Math.min(debt.balance, requestedAmount);
@@ -2074,9 +2255,32 @@ function createRecurringPaycheck(paycheck) {
   };
 }
 
+function getPaycheckCadence(paycheck) {
+  const related = [...state.paychecks]
+    .filter(
+      (item) =>
+        item.id !== paycheck.id &&
+        item.employer === paycheck.employer &&
+        item.payDate < paycheck.payDate,
+    )
+    .sort((a, b) => a.payDate.localeCompare(b.payDate));
+
+  const previous = related[related.length - 1];
+  if (previous) {
+    const lastGap = Math.round(
+      (startOfDay(new Date(`${paycheck.payDate}T12:00:00`)) -
+        startOfDay(new Date(`${previous.payDate}T12:00:00`))) /
+        86400000,
+    );
+    if (lastGap > 0) return lastGap;
+  }
+
+  return Number(paycheck.cadenceDays) || 14;
+}
+
 function scheduleNextPaycheck(paycheck) {
   if (!paycheck.recurring) return;
-  const cadenceDays = Number(paycheck.cadenceDays) || 14;
+  const cadenceDays = getPaycheckCadence(paycheck);
   const nextPayDate = new Date(`${paycheck.payDate}T12:00:00`);
   nextPayDate.setDate(nextPayDate.getDate() + cadenceDays);
   const nextDateString = toDateString(nextPayDate);
@@ -2202,6 +2406,8 @@ entryForm.addEventListener("submit", (event) => {
 });
 
 async function initializeApp() {
+  void registerServiceWorker();
+
   if (!supabaseClient) {
     setShellVisibility(false);
     setAuthStatus(

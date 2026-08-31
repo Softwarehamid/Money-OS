@@ -1,0 +1,2 @@
+[functions."send-moneyos-reminders"]
+  schedule = "0 14 * * *"
